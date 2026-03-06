@@ -2,7 +2,7 @@
   "name": "Dungeon Sweep",
   "short_name": "DungeonSweep",
   "description": "A minesweeper dungeon crawler — sweep rooms, avoid mines, escape alive.",
-  "start_url": "/",
+  "start_url": "./",
   "display": "fullscreen",
   "orientation": "portrait",
   "background_color": "#0f380f",
