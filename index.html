@@ -1,0 +1,1628 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Dungeon Sweep">
+<meta name="theme-color" content="#0f380f">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon.png">
+<title>DUNGEON SWEEP</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+  *, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+  html, body {
+    width:100%; height:100%;
+    background:#1a1a1a;
+    display:flex; align-items:center; justify-content:center;
+    overflow:hidden;
+    font-family: 'Press Start 2P', monospace;
+  }
+  canvas {
+    display:block;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// ─────────────────────────────────────────────────────────────────────
+// GAME BOY PALETTE (4 shades)
+// ─────────────────────────────────────────────────────────────────────
+const GB = {
+  L0: '#9bbc0f', // lightest  – highlights, player
+  L1: '#8bac0f', // light     – floor, UI fills
+  L2: '#306230', // dark      – walls, outlines
+  L3: '#0f380f', // darkest   – bg, tunnels, deep shadow
+  SCREEN_BG: '#8bac0f',
+  BEZEL: '#1a2e0a',
+  SHELL: '#2d4a1a',
+  // Minimap accent colours (break from strict 4-shade for readability)
+  MM_CUR:  '#4488ff', // blue  – current room
+  MM_VIS:  '#e8c000', // yellow – visited rooms
+  MM_FLAG: '#cc2222', // red   – flagged rooms
+  MM_UNVIS:'#1a2e0a', // very dark – unknown
+  MM_SENTRY:'#ffffff', // white – sentry position
+  // Button colours
+  BTN:     '#2d4a1a',
+  BTN_HI:  '#3d6a2a',
+  BTN_PR:  '#1a2e0a', // pressed
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// CANVAS SETUP – fits viewport, portrait 9:16 ish
+// ─────────────────────────────────────────────────────────────────────
+const C = document.getElementById('c');
+const X = C.getContext('2d');
+const BASE_W = 360, BASE_H = 680;
+let SCALE = 1;
+
+function resize() {
+  const maxW = window.innerWidth, maxH = window.innerHeight;
+  SCALE = Math.min(maxW / BASE_W, maxH / BASE_H);
+  C.style.width  = (BASE_W * SCALE) + 'px';
+  C.style.height = (BASE_H * SCALE) + 'px';
+  C.width  = BASE_W;
+  C.height = BASE_H;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ─────────────────────────────────────────────────────────────────────
+// LAYOUT CONSTANTS
+// ─────────────────────────────────────────────────────────────────────
+// Screen bezel (simulated GB LCD area)
+const SCR = { x:20, y:60, w:320, h:350 };
+// Room inner (inside screen)
+const ROOM = { x: SCR.x+20, y: SCR.y+20, w: SCR.w-40, h: SCR.h-40 };
+// Wall thickness
+const WT = 34;
+// Floor area
+const FL = {
+  x: ROOM.x + WT, y: ROOM.y + WT,
+  w: ROOM.w - WT*2, h: ROOM.h - WT*2
+};
+// Floor centre
+const FCX = ROOM.x + ROOM.w/2 | 0;
+const FCY = ROOM.y + ROOM.h/2 | 0;
+// Door width
+const DW = 52;
+// Minimap (bottom-right of screen)
+const MM = { x: SCR.x + SCR.w - 8, y: SCR.y + 8, cs: 8 }; // anchor top-right
+
+// HUD below screen
+const HUD_Y = SCR.y + SCR.h + 12;
+
+// ─────────────────────────────────────────────────────────────────────
+// GAME CONFIG
+// ─────────────────────────────────────────────────────────────────────
+const MODES = {
+  S: { gs: 6,  nm: 5,  label: 'SMALL'  },
+  M: { gs: 9,  nm: 15, label: 'MEDIUM' },
+  L: { gs: 12, nm: 25, label: 'LARGE'  },
+};
+const TOWER_FLOORS = 10;
+// Tower: mine count ramps from 8 → 28 across 10 floors
+function towerMines(floor) { return 8 + Math.floor((floor-1) * 2.2) | 0; }
+// Tower grid is always 9x9
+const TOWER_GS = 9;
+// Staircase appears after this fraction of safe rooms visited
+const STAIR_THRESHOLD = 0.70;
+
+// ─────────────────────────────────────────────────────────────────────
+// STATE
+// ─────────────────────────────────────────────────────────────────────
+let screen   = 'title';  // title | size | game
+let gameMode = 'classic'; // classic | endless | tower | sentry
+let sizeKey  = 'M';
+let grid, GS, NM;
+let px, py, phase, frame=0, roomsVisited, totalSafe;
+let flagMode = false;
+let flagModeAnim = 0;
+// Multi-floor state
+let floorNum  = 1;
+let score     = 0;
+let staircaseX = -1, staircaseY = -1;
+let transitioning = false;
+// Sentry state
+let sentries = []; // array of {x,y} objects
+let sentryDiff = 'medium'; // easy | medium | hard
+let moveCounter = 0; // counts player moves, used for easy mode skip
+
+// ─────────────────────────────────────────────────────────────────────
+// SEEDED RNG  (mulberry32)
+// ─────────────────────────────────────────────────────────────────────
+let rngState = 0;
+function seedRng(s){ rngState = s >>> 0; }
+function rng(){
+  rngState |= 0;
+  rngState = rngState + 0x6D2B79F5 | 0;
+  let t = Math.imul(rngState ^ rngState >>> 15, 1 | rngState);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+  return ((t ^ t >>> 14) >>> 0) / 4294967296;
+}
+function rngInt(n){ return Math.floor(rng() * n); }
+
+// ─────────────────────────────────────────────────────────────────────
+// DAILY DUNGEON
+// ─────────────────────────────────────────────────────────────────────
+function todayStr(){
+  const d = new Date();
+  return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
+}
+function dailySeed(){
+  const s = todayStr();
+  let h = 0x811c9dc5;
+  for(let i=0;i<s.length;i++){ h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h;
+}
+let isDailyMode = false;
+let dailyDone = false; // already played today
+
+function checkDailyDone(){
+  try {
+    const d = JSON.parse(localStorage.getItem('ds-daily')||'{}');
+    return d.date === todayStr();
+  } catch(e){ return false; }
+}
+function saveDailyResult(moves, won){
+  try {
+    localStorage.setItem('ds-daily', JSON.stringify({ date:todayStr(), moves, won }));
+  } catch(e){}
+}
+function getDailyResult(){
+  try { return JSON.parse(localStorage.getItem('ds-daily')||'null'); } catch(e){ return null; }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// STREAK
+// ─────────────────────────────────────────────────────────────────────
+let streak = 0;
+
+function loadStreak(){
+  try {
+    const s = JSON.parse(localStorage.getItem('ds-streak')||'{}');
+    const today = todayStr();
+    const yesterday = (()=>{ const d=new Date(); d.setDate(d.getDate()-1);
+      return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`; })();
+    if(s.last === today)           streak = s.count || 1;
+    else if(s.last === yesterday)  streak = s.count || 1; // played yesterday, will increment on win
+    else                           streak = 0;
+  } catch(e){ streak = 0; }
+}
+function bumpStreak(){
+  try {
+    const s = JSON.parse(localStorage.getItem('ds-streak')||'{}');
+    const today = todayStr();
+    if(s.last === today) return; // already counted today
+    const yesterday = (()=>{ const d=new Date(); d.setDate(d.getDate()-1);
+      return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`; })();
+    const newCount = s.last === yesterday ? (s.count||1)+1 : 1;
+    streak = newCount;
+    localStorage.setItem('ds-streak', JSON.stringify({ last:today, count:newCount }));
+  } catch(e){}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// ACHIEVEMENTS
+// ─────────────────────────────────────────────────────────────────────
+const ACHIEVEMENTS = [
+  { id:'first_win',   icon:'★', label:'FIRST BLOOD',    desc:'Win any game'             },
+  { id:'ghost',       icon:'◎', label:'GHOST',           desc:'Win without flagging'      },
+  { id:'speedrun',    icon:'⚡', label:'SPEEDRUN',        desc:'Win classic in under 25 moves' },
+  { id:'survivor',    icon:'▲', label:'SURVIVOR',        desc:'Escape the Tower'          },
+  { id:'untouchable', icon:'◈', label:'UNTOUCHABLE',     desc:'Beat Sentry Hard'          },
+  { id:'daily',       icon:'☀', label:'DAILY PLAYER',   desc:'Complete a Daily Dungeon'  },
+  { id:'streak3',     icon:'♦', label:'ON A ROLL',       desc:'3-day streak'              },
+  { id:'no_mistakes', icon:'✦', label:'PERFECTION',      desc:'Win classic with 0 rooms left unvisited on first try' },
+];
+
+let achievements = {};
+
+function loadAchievements(){
+  try { achievements = JSON.parse(localStorage.getItem('ds-achievements')||'{}'); } catch(e){ achievements={}; }
+}
+function saveAchievements(){
+  try { localStorage.setItem('ds-achievements', JSON.stringify(achievements)); } catch(e){}
+}
+
+let newAchievement = null; // {icon, label} — shown briefly on win
+let achTimer = 0;
+
+function checkAchievements(){
+  const unlocked = [];
+  const earn = (id) => {
+    if(!achievements[id]){ achievements[id]=true; unlocked.push(id); }
+  };
+  if(phase==='won'||phase==='nextfloor'){
+    earn('first_win');
+    if(countFlags()===0) earn('ghost');
+    if((gameMode==='classic'||gameMode==='sentry') && moveCounter<25) earn('speedrun');
+    if(gameMode==='tower' && phase==='won') earn('survivor');
+    if(gameMode==='sentry' && sentryDiff==='hard') earn('untouchable');
+    if(isDailyMode) earn('daily');
+    if(streak>=3) earn('streak3');
+  }
+  if(unlocked.length){
+    saveAchievements();
+    const first = ACHIEVEMENTS.find(a=>a.id===unlocked[0]);
+    if(first){ newAchievement=first; achTimer=180; }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// SEED SHARING
+// ─────────────────────────────────────────────────────────────────────
+let currentSeed = 0;
+let challengeSeed = 0;   // 0 = no challenge active
+let showSeedCode = false;
+
+function seedToCode(s){ return (s>>>0).toString(36).toUpperCase().padStart(7,'0'); }
+function codeToSeed(c){
+  const n = parseInt(c.trim().toUpperCase(), 36);
+  return isNaN(n) ? 0 : n >>> 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// SOUNDS  (Web Audio API — fully procedural)
+// ─────────────────────────────────────────────────────────────────────
+let audioCtx = null;
+let soundOn = true;
+
+function getAudio(){
+  if(!audioCtx) try { audioCtx = new (window.AudioContext||window.webkitAudioContext)(); } catch(e){}
+  return audioCtx;
+}
+
+function playTone(freq, type, dur, vol=0.18, delay=0){
+  const ac = getAudio(); if(!ac||!soundOn) return;
+  const o = ac.createOscillator();
+  const g = ac.createGain();
+  o.connect(g); g.connect(ac.destination);
+  o.type = type; o.frequency.value = freq;
+  const t = ac.currentTime + delay;
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t+dur);
+  o.start(t); o.stop(t+dur+0.01);
+}
+
+function sndMove(){
+  playTone(220, 'square', 0.04, 0.10);
+}
+function sndFlag(){
+  playTone(440, 'square', 0.06, 0.12);
+  playTone(330, 'square', 0.06, 0.08, 0.05);
+}
+function sndMine(){
+  const ac = getAudio(); if(!ac||!soundOn) return;
+  // Noise burst
+  const buf = ac.createBuffer(1,ac.sampleRate*0.4,ac.sampleRate);
+  const d = buf.getChannelData(0);
+  for(let i=0;i<d.length;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/d.length,1.5);
+  const src = ac.createBufferSource();
+  const g = ac.createGain();
+  src.buffer=buf; src.connect(g); g.connect(ac.destination);
+  g.gain.setValueAtTime(0.4, ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime+0.4);
+  src.start();
+  // Low thud underneath
+  playTone(55, 'sine', 0.3, 0.3);
+}
+function sndCaught(){
+  playTone(880,'square',0.08,0.15);
+  playTone(440,'square',0.08,0.15,0.09);
+  playTone(220,'square',0.2, 0.15,0.18);
+}
+function sndWin(){
+  // Ascending fanfare
+  [262,330,392,523].forEach((f,i)=>playTone(f,'square',0.12,0.18,i*0.1));
+}
+function sndAscend(){
+  [330,392,494].forEach((f,i)=>playTone(f,'square',0.1,0.15,i*0.08));
+}
+function sndUnlock(){
+  [523,659,784,1047].forEach((f,i)=>playTone(f,'triangle',0.15,0.2,i*0.07));
+}
+
+
+// Key format: 'classic-M', 'tower', 'endless', 'sentry-easy' etc.
+let records = {}; // loaded async on init
+
+function recordKey() {
+  if(gameMode==='classic') return `classic-${sizeKey}`;
+  if(gameMode==='sentry')  return `sentry-${sentryDiff}`;
+  return gameMode; // tower, endless
+}
+
+async function loadRecords() {
+  try {
+    const raw = localStorage.getItem('dungeon-sweep-records');
+    records = raw ? JSON.parse(raw) : {};
+  } catch(e) { records = {}; }
+}
+
+async function saveRecord(key, moves, floors) {
+  // For endless/tower: score = floors survived (more = better)
+  // For classic/sentry: score = moves (fewer = better)
+  const isHigherBetter = (gameMode==='endless');
+  const entry = { moves, floors, date: new Date().toLocaleDateString() };
+  const existing = records[key];
+  let isNew = false;
+  if(!existing) {
+    isNew = true;
+  } else if(isHigherBetter && floors > (existing.floors||0)) {
+    isNew = true;
+  } else if(!isHigherBetter && moves < existing.moves) {
+    isNew = true;
+  }
+  if(isNew) {
+    records[key] = entry;
+    try { localStorage.setItem('dungeon-sweep-records', JSON.stringify(records)); } catch(e){}
+  }
+  return isNew;
+}
+
+let newRecordFlag = false; // flashes on win screen if record beaten
+
+function sentryCfg() {
+  // Returns {count, everyN} — how many sentries and how often they move (every N turns)
+  if(gameMode==='tower'){
+    const count = floorNum >= 10 ? 2 : 1;
+    return { count, everyN: 1 };
+  }
+  if(sentryDiff==='easy')   return { count:1, everyN:2 };
+  if(sentryDiff==='hard')   return { count:2, everyN:1 };
+  return { count:1, everyN:1 }; // medium
+}
+
+function cell(x,y) {
+  if(x<0||x>=GS||y<0||y>=GS) return null;
+  return grid[y*GS+x];
+}
+function mineExits(x,y) {
+  let n=0;
+  ['n','s','e','w'].forEach(d => {
+    const [nx,ny] = neighbour(x,y,d);
+    if(cell(nx,ny)?.mine) n++;
+  });
+  return n;
+}
+function neighbour(x,y,d) {
+  if(d==='n') return [x,y-1];
+  if(d==='s') return [x,y+1];
+  if(d==='w') return [x-1,y];
+  if(d==='e') return [x+1,y];
+}
+function hasExit(x,y,d) {
+  const [nx,ny] = neighbour(x,y,d);
+  return nx>=0&&nx<GS&&ny>=0&&ny<GS;
+}
+
+function startGame() {
+  floorNum = 1;
+  score    = 0;
+  staircaseX = staircaseY = -1;
+  transitioning = false;
+  sentries = [];
+  showSeedCode = false;
+
+  if(isDailyMode){
+    currentSeed = dailySeed();
+    GS = 9; NM = 12; // fixed medium grid for daily
+    seedRng(currentSeed);
+  } else if(challengeSeed){
+    currentSeed = challengeSeed;
+    GS = 9; NM = 12;
+    seedRng(currentSeed);
+  } else {
+    currentSeed = (Math.random() * 0xFFFFFFFF) >>> 0;
+    if(gameMode === 'classic'){
+      const cfg = MODES[sizeKey];
+      GS = cfg.gs; NM = cfg.nm;
+    } else if(gameMode === 'tower'){
+      GS = TOWER_GS; NM = towerMines(1);
+    } else if(gameMode === 'sentry'){
+      GS = 9; NM = 12;
+    } else { // endless
+      GS = 6; NM = 8;
+    }
+  }
+  buildFloor();
+  screen = 'game';
+}
+
+function buildFloor() {
+  // Set GS/NM for endless ramp
+  if(gameMode === 'endless' && floorNum > 1){
+    const roll = Math.random();
+    if(roll < 0.30) {
+      // 30%: grow grid AND mines
+      GS = Math.min(GS + 1, 12);
+    }
+    // Always increase mines
+    NM = Math.min(NM + Math.floor(Math.random()*2)+2, Math.floor(GS*GS*0.35));
+  }
+  if(gameMode === 'tower'){
+    NM = towerMines(floorNum);
+  }
+
+  // Keep regenerating until all safe rooms are reachable
+  // Use seeded rng for daily/challenge, Math.random otherwise
+  const rand = (isDailyMode || challengeSeed) ? rng : Math.random;
+  const randInt = (n) => Math.floor(rand() * n);
+
+  while(true){
+    grid = [];
+    for(let i=0;i<GS*GS;i++)
+      grid.push({mine:false,visited:false,stair:false,flags:{n:false,s:false,e:false,w:false}});
+
+    const safe = new Set();
+    for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++) safe.add(`${dx},${dy}`);
+
+    let placed=0;
+    while(placed<NM){
+      const x=randInt(GS), y=randInt(GS);
+      if(!cell(x,y).mine&&!safe.has(`${x},${y}`)){cell(x,y).mine=true;placed++;}
+    }
+
+    const reachable = new Set(['0,0']);
+    const queue = [[0,0]];
+    while(queue.length){
+      const [cx,cy] = queue.shift();
+      for(const d of ['n','s','e','w']){
+        const [nx,ny] = neighbour(cx,cy,d);
+        if(nx<0||nx>=GS||ny<0||ny>=GS) continue;
+        const key=`${nx},${ny}`;
+        if(reachable.has(key)||cell(nx,ny).mine) continue;
+        reachable.add(key); queue.push([nx,ny]);
+      }
+    }
+    if(reachable.size >= GS*GS - NM) break;
+    if(isDailyMode || challengeSeed) seedRng(currentSeed + placed); // re-seed on retry
+  }
+
+  totalSafe  = GS*GS - NM;
+  staircaseX = staircaseY = -1;
+  px=0; py=0;
+  cell(0,0).visited = true;
+  roomsVisited = 1;
+  phase = 'play';
+  flagMode = false;
+  moveCounter = 0;
+
+  // Spawn sentries for sentry mode, or tower floors 8+
+  const needSentries = gameMode==='sentry' || (gameMode==='tower' && floorNum>=8);
+  if(needSentries){
+    sentries = [];
+    const cfg = sentryCfg();
+    // Candidate spawn corners — far from player at (0,0)
+    const corners = [
+      [GS-1,GS-1],[GS-1,0],[0,GS-1],
+      [GS-1,GS-2],[GS-2,GS-1],[GS-2,GS-2]
+    ];
+    // Filter to safe cells, pick furthest first
+    const safeCorners = corners.filter(([cx,cy])=>!cell(cx,cy)?.mine);
+    for(let i=0; i<Math.min(cfg.count, safeCorners.length); i++){
+      sentries.push({x:safeCorners[i][0], y:safeCorners[i][1]});
+    }
+  } else {
+    sentries = [];
+  }
+}
+
+function placeStaircase() {
+  // Pick a random safe unvisited room to place the staircase
+  // (prefer unvisited so player has to keep exploring)
+  const candidates = [];
+  for(let y=0;y<GS;y++) for(let x=0;x<GS;x++){
+    const c=cell(x,y);
+    // Exclude mines, player start (0,0), and player's current room
+    if(!c.mine && !(x===0&&y===0) && !(x===px&&y===py)) candidates.push([x,y]);
+  }
+  // shuffle
+  for(let i=candidates.length-1;i>0;i--){
+    const j=Math.floor(Math.random()*(i+1));
+    [candidates[i],candidates[j]]=[candidates[j],candidates[i]];
+  }
+  // prefer unvisited
+  const pick = candidates.find(([x,y])=>!cell(x,y).visited) || candidates[0];
+  [staircaseX, staircaseY] = pick;
+  cell(staircaseX, staircaseY).stair = true;
+}
+
+// ── SENTRY PATHFINDING ──────────────────────────────────────────────
+// BFS from sentry to player, returns one step towards player.
+// otherPositions = set of cells occupied by other sentries (treated as soft obstacles)
+function sentryNextStep(sx, sy, otherPositions) {
+  if(sx===px && sy===py) return [sx,sy];
+  const visited = new Set([`${sx},${sy}`]);
+  const queue = [];
+  for(const d of ['n','s','e','w']){
+    const [nx,ny] = neighbour(sx,sy,d);
+    if(nx<0||nx>=GS||ny<0||ny>=GS) continue;
+    if(cell(nx,ny)?.mine) continue;
+    const key=`${nx},${ny}`;
+    if(visited.has(key)) continue;
+    visited.add(key);
+    queue.push([nx,ny,nx,ny]);
+  }
+  while(queue.length){
+    const [cx,cy,fx,fy] = queue.shift();
+    if(cx===px && cy===py) return [fx,fy];
+    for(const d of ['n','s','e','w']){
+      const [nx,ny] = neighbour(cx,cy,d);
+      if(nx<0||nx>=GS||ny<0||ny>=GS) continue;
+      if(cell(nx,ny)?.mine) continue;
+      // Avoid other sentries unless no other path exists (soft obstacle)
+      if(otherPositions.has(`${nx},${ny}`) && !(nx===px&&ny===py)) continue;
+      const key=`${nx},${ny}`;
+      if(visited.has(key)) continue;
+      visited.add(key);
+      queue.push([nx,ny,fx,fy]);
+    }
+  }
+  return [sx,sy]; // no path found – stay put
+}
+
+function moveSentries() {
+  const { everyN } = sentryCfg();
+  if(moveCounter % everyN !== 0) return;
+  for(let i=0; i<sentries.length; i++){
+    const s = sentries[i];
+    // Build set of other sentries' current positions
+    const others = new Set(
+      sentries.filter((_,j)=>j!==i).map(o=>`${o.x},${o.y}`)
+    );
+    const [nx,ny] = sentryNextStep(s.x, s.y, others);
+    s.x = nx; s.y = ny;
+    if(s.x===px && s.y===py){
+      phase='caught';
+      sndCaught();
+      if(gameMode==='endless'){
+        newRecordFlag = false;
+        saveRecord('endless', moveCounter, floorNum).then(isNew => { newRecordFlag = isNew; });
+      }
+      return;
+    }
+  }
+}
+
+function doMove(dx,dy) {
+  if(phase!=='play') return;
+  const nx=px+dx, ny=py+dy;
+  if(nx<0||nx>=GS||ny<0||ny>=GS) return;
+  px=nx; py=ny;
+  moveCounter++;
+  const c=cell(px,py);
+  if(c.mine){
+    c.visited=true; phase='dead';
+    sndMine();
+    if(gameMode==='endless'){
+      newRecordFlag = false;
+      saveRecord('endless', moveCounter, floorNum).then(isNew => { newRecordFlag = isNew; });
+    }
+    return;
+  }
+  if(!c.visited){ c.visited=true; roomsVisited++; }
+  sndMove();
+
+  const visitedSafe = grid.filter(c=>c.visited&&!c.mine).length;
+  const hasSentries = sentries.length > 0;
+
+  // ── CLASSIC / SENTRY win ───────────────────────────────────────────
+  if(gameMode==='classic' || gameMode==='sentry'){
+    if(visitedSafe >= totalSafe){
+      phase='won';
+      sndWin();
+      if(isDailyMode){ saveDailyResult(moveCounter, true); bumpStreak(); dailyDone=true; }
+      newRecordFlag = false;
+      saveRecord(recordKey(), moveCounter, 1).then(isNew => { newRecordFlag = isNew; });
+      showSeedCode = true;
+      checkAchievements();
+    }
+    if(phase==='play' && hasSentries) moveSentries();
+    return;
+  }
+
+  // ── TOWER / ENDLESS: reveal staircase once threshold met ───────────
+  if(staircaseX===-1 && visitedSafe >= Math.ceil(totalSafe * STAIR_THRESHOLD)){
+    placeStaircase();
+  }
+
+  // ── Entered the staircase room – checked BEFORE sentry moves ──────
+  if(c.stair && staircaseX !== -1){
+    if(gameMode==='tower'){
+      if(floorNum >= TOWER_FLOORS){
+        phase = 'won';
+        sndWin();
+        newRecordFlag = false;
+        saveRecord('tower', moveCounter, TOWER_FLOORS).then(isNew => { newRecordFlag = isNew; });
+        showSeedCode = true;
+        checkAchievements();
+      } else {
+        phase = 'nextfloor';
+        sndAscend();
+      }
+    } else {
+      score++;
+      sndAscend();
+      newRecordFlag = false;
+      saveRecord('endless', moveCounter, score).then(isNew => { newRecordFlag = isNew; });
+      phase = 'nextfloor';
+    }
+    return;
+  }
+
+  // Move tower/endless sentries after staircase check
+  if(phase==='play' && hasSentries) moveSentries();
+}
+
+function advanceFloor(){
+  floorNum++;
+  buildFloor();
+}
+
+function doFlag(dx,dy) {
+  if(phase!=='play') return;
+  const [nx,ny]=neighbour(px,py, dx===0?(dy<0?'n':'s'):(dx<0?'w':'e'));
+  if(nx<0||nx>=GS||ny<0||ny>=GS) return;
+  const dirs={[`0,-1`]:'n',[`0,1`]:'s',[`-1,0`]:'w',[`1,0`]:'e'};
+  const d=dirs[`${dx},${dy}`];
+  if(d){ cell(px,py).flags[d] = !cell(px,py).flags[d]; sndFlag(); }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// TOUCH INPUT
+// ─────────────────────────────────────────────────────────────────────
+let touchX0, touchY0, touchT0, holdTimer=null, holdFired=false;
+const HOLD_MS = 450, SWIPE_MIN = 28;
+
+function getCanvasPos(clientX, clientY) {
+  const r = C.getBoundingClientRect();
+  return {
+    x: (clientX - r.left) / SCALE,
+    y: (clientY - r.top)  / SCALE
+  };
+}
+
+C.addEventListener('touchstart', e => {
+  e.preventDefault();
+  const t = e.touches[0];
+  touchX0 = t.clientX; touchY0 = t.clientY; touchT0 = Date.now();
+  holdFired = false;
+  clearTimeout(holdTimer);
+  holdTimer = setTimeout(() => {
+    holdFired = true;
+    flagMode = true;
+    navigator.vibrate && navigator.vibrate(60);
+  }, HOLD_MS);
+}, {passive:false});
+
+C.addEventListener('touchmove', e => {
+  e.preventDefault();
+  const t = e.touches[0];
+  const dx = t.clientX - touchX0, dy = t.clientY - touchY0;
+  if(Math.sqrt(dx*dx+dy*dy) > 12) { clearTimeout(holdTimer); }
+}, {passive:false});
+
+C.addEventListener('touchend', e => {
+  e.preventDefault();
+  clearTimeout(holdTimer);
+  const t = e.changedTouches[0];
+  const dx = t.clientX - touchX0, dy = t.clientY - touchY0;
+  const dist = Math.sqrt(dx*dx+dy*dy);
+  const duration = Date.now() - touchT0;
+  const pos = getCanvasPos(t.clientX, t.clientY);
+
+  if(screen === 'title' || screen === 'size' || screen === 'sentryDiff' || screen === 'records' || screen === 'achievements' || screen === 'challenge') {
+    if(dist < 20) handleMenuTap(pos.x, pos.y);
+    return;
+  }
+
+  if(screen === 'game') {
+    if(phase === 'nextfloor'){
+      if(handleGameBtnTap(pos.x, pos.y)) return;
+      if(dist < 12){ advanceFloor(); }
+      return;
+    }
+    if(phase !== 'play') {
+      if(handleGameBtnTap(pos.x, pos.y)) return;
+      if(dist < 12) { screen='title'; flagMode=false; }
+      return;
+    }
+    // Check D-pad / flag / restart buttons first
+    if(dist < 14 && handleGameBtnTap(pos.x, pos.y)) return;
+
+    // Only toggle flag mode if tapping inside the game screen, not the controls panel
+    if(dist < 12 && pos.y < HUD_Y) {
+      flagMode = !flagMode;
+      return;
+    }
+    if(dist >= SWIPE_MIN) {
+      const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+      let mdx=0, mdy=0;
+      if(angle > -45 && angle <= 45)        { mdx=1; }
+      else if(angle > 45 && angle <= 135)   { mdy=1; }
+      else if(angle > 135 || angle <= -135) { mdx=-1; }
+      else                                  { mdy=-1; }
+
+      if(holdFired || flagMode) {
+        doFlag(mdx, mdy);
+        flagMode = false;
+      } else {
+        doMove(mdx, mdy);
+      }
+    }
+  }
+}, {passive:false});
+
+// ─────────────────────────────────────────────────────────────────────
+// KEYBOARD INPUT (desktop fallback)
+// ─────────────────────────────────────────────────────────────────────
+const keys = {};
+document.addEventListener('keydown', e => {
+  if(keys[e.code]) return;
+  keys[e.code] = true;
+  if(e.code==='KeyR'&&screen==='game') { startGame(); return; }
+  if(e.code==='Space'&&screen==='game'&&phase==='nextfloor'){ advanceFloor(); return; }
+  if(screen!=='game'||phase!=='play') return;
+  const f = keys['KeyF'] || flagMode;
+  const map = {
+    ArrowUp:    [0,-1], ArrowDown:  [0, 1],
+    ArrowLeft:  [-1,0], ArrowRight: [1, 0],
+  };
+  if(map[e.code]){
+    const [dx,dy] = map[e.code];
+    f ? doFlag(dx,dy) : doMove(dx,dy);
+    e.preventDefault();
+  }
+});
+document.addEventListener('keyup', e => { keys[e.code]=false; });
+
+// ─────────────────────────────────────────────────────────────────────
+// MENU TAP HANDLING
+// ─────────────────────────────────────────────────────────────────────
+const menuButtons = [];
+function registerBtn(id, x,y,w,h, action) {
+  menuButtons.push({id,x,y,w,h,action});
+}
+function handleMenuTap(tx,ty) {
+  for(const b of menuButtons) {
+    if(tx>=b.x&&tx<=b.x+b.w&&ty>=b.y&&ty<=b.y+b.h) { b.action(); return; }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// DRAW HELPERS
+// ─────────────────────────────────────────────────────────────────────
+function r(x,y,w,h,fill,stroke,lw){
+  if(fill){ X.fillStyle=fill; X.fillRect(x,y,w,h); }
+  if(stroke){ X.strokeStyle=stroke; X.lineWidth=lw||1; X.strokeRect(x,y,w,h); }
+}
+function txt(s,x,y,color,sz,align,base){
+  X.font=`${sz}px 'Press Start 2P'`;
+  X.textAlign=align||'center';
+  X.textBaseline=base||'middle';
+  X.fillStyle=color;
+  X.fillText(s,x,y);
+}
+function pixBorder(x,y,w,h,c1,c2,c3) {
+  // Chunky 3-shade pixel border
+  r(x,y,w,h,null,c3,3);
+  r(x+2,y+2,w-4,h-4,null,c1,1);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// SCREEN: TITLE
+// ─────────────────────────────────────────────────────────────────────
+function drawTitle(){
+  menuButtons.length = 0;
+  r(0,0,BASE_W,BASE_H,GB.L3);
+
+  // GB shell top
+  r(10,10,BASE_W-20,BASE_H-20,GB.SHELL,GB.L3,2);
+
+  // GB screen bezel
+  r(SCR.x-4,SCR.y-4,SCR.w+8,SCR.h+8,GB.L3);
+  r(SCR.x,SCR.y,SCR.w,SCR.h,GB.L2);
+
+  // Screen area
+  r(SCR.x+6,SCR.y+6,SCR.w-12,SCR.h-12,GB.SCREEN_BG);
+
+  // Title
+  txt('DUNGEON',BASE_W/2, SCR.y+60, GB.L3, 16, 'center');
+  txt('SWEEP',  BASE_W/2, SCR.y+84, GB.L3, 16, 'center');
+  // Decorative line
+  r(SCR.x+20, SCR.y+100, SCR.w-40, 3, GB.L2);
+
+  // Mode buttons
+  const btnW=220, btnH=32, btnX=(BASE_W-btnW)/2;
+  const modes=[
+    {label:'CLASSIC',   sub:'SWEEP ALL ROOMS',     key:'classic', y:SCR.y+110},
+    {label:'ENDLESS',   sub:'HOW FAR CAN YOU GO?', key:'endless', y:SCR.y+152},
+    {label:'THE TOWER', sub:'10 FLOORS TO FREEDOM',key:'tower',   y:SCR.y+194},
+    {label:'SENTRY',    sub:'DON\'T GET CAUGHT',    key:'sentry',  y:SCR.y+236},
+  ];
+  for(const m of modes){
+    r(btnX, m.y, btnW, btnH, GB.L1, GB.L3, 2);
+    r(btnX+2,m.y+2,btnW-4,2,GB.L0);
+    txt(m.label, BASE_W/2, m.y+11, GB.L3, 9, 'center');
+    txt(m.sub,   BASE_W/2, m.y+23, GB.L2, 6, 'center');
+    registerBtn(m.key, btnX, m.y, btnW, btnH, ()=>{
+      gameMode=m.key; isDailyMode=false; challengeSeed=0;
+      if(m.key==='classic') screen='size';
+      else if(m.key==='sentry') screen='sentryDiff';
+      else startGame();
+    });
+  }
+
+  // Daily Dungeon button
+  const ddone = checkDailyDone();
+  const dy2 = SCR.y+278;
+  r(btnX, dy2, btnW, btnH+2, ddone?GB.L2:GB.L0, GB.L3, 2);
+  r(btnX+2,dy2+2,btnW-4,2,GB.L2);
+  txt('☀ DAILY DUNGEON', BASE_W/2, dy2+11, ddone?GB.L2:GB.L3, 8, 'center');
+  txt(ddone?'COMPLETED TODAY':'NEW PUZZLE EVERY DAY', BASE_W/2, dy2+25, ddone?GB.L1:GB.MM_VIS, 5, 'center');
+  if(!ddone) registerBtn('daily', btnX, dy2, btnW, btnH+2, ()=>{
+    gameMode='classic'; isDailyMode=true; challengeSeed=0; sizeKey='M'; startGame();
+  });
+
+  // Streak counter
+  if(streak>0){
+    txt(`♦ ${streak} DAY STREAK`, BASE_W/2, SCR.y+330, GB.MM_VIS, 7, 'center');
+  }
+
+  // Blinking "TAP TO SELECT" inside screen at bottom
+  if(Math.floor(frame/22)%2===0){
+    txt('TAP TO SELECT', BASE_W/2, SCR.y+SCR.h-18, GB.L2, 7, 'center');
+  }
+
+  // Footer buttons below screen bezel
+  const footerY = SCR.y + SCR.h + 20;
+  const fbW=88, fbH=22, fbGap=6;
+  const fbTotalW = fbW*3+fbGap*2, fbX=(BASE_W-fbTotalW)/2;
+
+  // Records
+  r(fbX, footerY, fbW, fbH, GB.L3, GB.L2, 1);
+  txt('★ RECORDS', fbX+fbW/2, footerY+11, GB.MM_VIS, 5, 'center');
+  registerBtn('records', fbX, footerY, fbW, fbH, ()=>{ screen='records'; });
+
+  // Achievements
+  const earned2 = ACHIEVEMENTS.filter(a=>achievements[a.id]).length;
+  r(fbX+fbW+fbGap, footerY, fbW, fbH, GB.L3, GB.L2, 1);
+  txt(`✦ ACH ${earned2}/${ACHIEVEMENTS.length}`, fbX+fbW+fbGap+fbW/2, footerY+11, GB.L1, 5, 'center');
+  registerBtn('achievements', fbX+fbW+fbGap, footerY, fbW, fbH, ()=>{ screen='achievements'; });
+
+  // Challenge
+  r(fbX+fbW*2+fbGap*2, footerY, fbW, fbH, GB.L3, GB.L2, 1);
+  txt('◈ CHALLENGE', fbX+fbW*2+fbGap*2+fbW/2, footerY+11, GB.L1, 5, 'center');
+  registerBtn('challenge', fbX+fbW*2+fbGap*2, footerY, fbW, fbH, ()=>{ screen='challenge'; });
+
+  // Sound toggle
+  const sndY = footerY + fbH + 10;
+  txt(soundOn?'♪ SOUND ON':'♪ SOUND OFF', BASE_W/2, sndY+8, soundOn?GB.L2:GB.L3, 6, 'center');
+  registerBtn('sound', 0, sndY, BASE_W, 20, ()=>{ soundOn=!soundOn; });
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// SCREEN: SIZE SELECT
+// ─────────────────────────────────────────────────────────────────────
+function drawSizeSelect(){
+  menuButtons.length = 0;
+  r(0,0,BASE_W,BASE_H,GB.L3);
+  r(10,10,BASE_W-20,BASE_H-20,GB.SHELL,GB.L3,2);
+  r(SCR.x-4,SCR.y-4,SCR.w+8,SCR.h+8,GB.L3);
+  r(SCR.x,SCR.y,SCR.w,SCR.h,GB.L2);
+  r(SCR.x+6,SCR.y+6,SCR.w-12,SCR.h-12,GB.SCREEN_BG);
+
+  txt('SELECT SIZE', BASE_W/2, SCR.y+40, GB.L3, 10, 'center');
+  r(SCR.x+20, SCR.y+58, SCR.w-40, 3, GB.L2);
+
+  const sizes=[
+    {key:'S', label:'SMALL',  detail:'6×6  · 5 MINES'},
+    {key:'M', label:'MEDIUM', detail:'9×9  · 15 MINES'},
+    {key:'L', label:'LARGE',  detail:'12×12 · 25 MINES'},
+  ];
+  const btnW=230, btnH=48, btnX=(BASE_W-btnW)/2;
+  sizes.forEach((s,i)=>{
+    const by = SCR.y + 76 + i*66;
+    const sel = sizeKey===s.key;
+    r(btnX, by, btnW, btnH, sel?GB.L0:GB.L1, GB.L3, 2);
+    if(sel) r(btnX+2,by+2,btnW-4,3,GB.L2);
+    txt(s.label,  BASE_W/2, by+16, GB.L3, 10, 'center');
+    txt(s.detail, BASE_W/2, by+32, sel?GB.L2:GB.L3, 7, 'center');
+    registerBtn(s.key, btnX, by, btnW, btnH, ()=>{ sizeKey=s.key; });
+  });
+
+  // START GAME sits below the screen bezel with clear breathing room
+  const startY = SCR.y + SCR.h + 16;
+  const sw=200, sh=36, sx=(BASE_W-sw)/2;
+  r(sx, startY, sw, sh, GB.L2, GB.L3, 2);
+  r(sx+2,startY+2,sw-4,3,GB.L1);
+  txt('START GAME', BASE_W/2, startY+18, GB.L0, 9, 'center');
+  registerBtn('start', sx, startY, sw, sh, ()=>startGame());
+
+  const backY = startY + sh + 16;
+  txt('← BACK', BASE_W/2, backY, GB.L2, 7, 'center');
+  registerBtn('back', 0, backY-10, BASE_W, 24, ()=>{ screen='title'; });
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// SCREEN: SENTRY DIFFICULTY
+// ─────────────────────────────────────────────────────────────────────
+function drawSentryDiff(){
+  menuButtons.length = 0;
+  r(0,0,BASE_W,BASE_H,GB.L3);
+  r(10,10,BASE_W-20,BASE_H-20,GB.SHELL,GB.L3,2);
+  r(SCR.x-4,SCR.y-4,SCR.w+8,SCR.h+8,GB.L3);
+  r(SCR.x,SCR.y,SCR.w,SCR.h,GB.L2);
+  r(SCR.x+6,SCR.y+6,SCR.w-12,SCR.h-12,GB.SCREEN_BG);
+
+  txt('SENTRY MODE', BASE_W/2, SCR.y+36, GB.L3, 10, 'center');
+  r(SCR.x+20, SCR.y+54, SCR.w-40, 3, GB.L2);
+  txt('SELECT DIFFICULTY', BASE_W/2, SCR.y+70, GB.L2, 7, 'center');
+
+  const diffs=[
+    {key:'easy',   label:'EASY',   detail:'SENTRY MOVES EVERY 2 TURNS', icon:'◈'},
+    {key:'medium', label:'MEDIUM', detail:'SENTRY MOVES EVERY TURN',    icon:'◈◈'},
+    {key:'hard',   label:'HARD',   detail:'2 SENTRIES · EVERY TURN',    icon:'◈◈◈'},
+  ];
+  const btnW=260, btnH=52, btnX=(BASE_W-btnW)/2;
+  diffs.forEach((d,i)=>{
+    const by = SCR.y + 90 + i*70;
+    const sel = sentryDiff===d.key;
+    r(btnX, by, btnW, btnH, sel?GB.L0:GB.L1, GB.L3, 2);
+    if(sel) r(btnX+2,by+2,btnW-4,3,GB.L2);
+    // Sentry icon(s) in white on left
+    txt(d.icon, btnX+22, by+btnH/2, GB.MM_SENTRY, 9, 'left');
+    txt(d.label,  BASE_W/2+8, by+16, GB.L3, 10, 'center');
+    txt(d.detail, BASE_W/2+8, by+34, sel?GB.L2:GB.L3, 6, 'center');
+    registerBtn(d.key, btnX, by, btnW, btnH, ()=>{ sentryDiff=d.key; });
+  });
+
+  const startY = SCR.y + SCR.h + 16;
+  const sw=200, sh=36, sx=(BASE_W-sw)/2;
+  r(sx, startY, sw, sh, GB.L2, GB.L3, 2);
+  r(sx+2,startY+2,sw-4,3,GB.L1);
+  txt('START GAME', BASE_W/2, startY+18, GB.L0, 9, 'center');
+  registerBtn('start', sx, startY, sw, sh, ()=>startGame());
+
+  const backY = startY + sh + 16;
+  txt('← BACK', BASE_W/2, backY, GB.L2, 7, 'center');
+  registerBtn('back', 0, backY-10, BASE_W, 24, ()=>{ screen='title'; });
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// SCREEN: RECORDS
+// ─────────────────────────────────────────────────────────────────────
+function drawRecords(){
+  menuButtons.length = 0;
+  r(0,0,BASE_W,BASE_H,GB.L3);
+  r(10,10,BASE_W-20,BASE_H-20,GB.SHELL,GB.L3,2);
+  r(SCR.x-4,SCR.y-4,SCR.w+8,SCR.h+8,GB.L3);
+  r(SCR.x,SCR.y,SCR.w,SCR.h,GB.L2);
+  r(SCR.x+6,SCR.y+6,SCR.w-12,SCR.h-12,GB.SCREEN_BG);
+
+  txt('★ RECORDS', BASE_W/2, SCR.y+36, GB.L3, 11, 'center');
+  r(SCR.x+20, SCR.y+54, SCR.w-40, 3, GB.L2);
+
+  const entries = [
+    { key:'classic-S', label:'CLASSIC  S', isHigh:false },
+    { key:'classic-M', label:'CLASSIC  M', isHigh:false },
+    { key:'classic-L', label:'CLASSIC  L', isHigh:false },
+    { key:'tower',     label:'THE TOWER',  isHigh:false },
+    { key:'endless',   label:'ENDLESS',    isHigh:true  },
+    { key:'sentry-easy',   label:'SENTRY EASY', isHigh:false },
+    { key:'sentry-medium', label:'SENTRY MED',  isHigh:false },
+    { key:'sentry-hard',   label:'SENTRY HARD', isHigh:false },
+  ];
+
+  const rowH = 28, rowsY = SCR.y + 66;
+  entries.forEach((e, i) => {
+    const ry = rowsY + i * rowH;
+    if(i%2===0) r(SCR.x+6, ry, SCR.w-12, rowH, GB.L1);
+    txt(e.label, SCR.x+14, ry+rowH/2, GB.L3, 6, 'left');
+    const rec = records[e.key];
+    if(rec){
+      const val = e.isHigh ? `${rec.floors} FLR` : `${rec.moves} MOV`;
+      txt(val,      SCR.x+SCR.w-14, ry+rowH/2, GB.MM_VIS, 7, 'right');
+      if(rec.date) txt(rec.date, BASE_W/2+10, ry+rowH/2, GB.L2, 5, 'center');
+    } else {
+      txt('---', SCR.x+SCR.w-14, ry+rowH/2, GB.L2, 6, 'right');
+    }
+  });
+
+  // Clear + Back below screen — well spaced
+  const cy2 = SCR.y + SCR.h + 22;
+  r((BASE_W-130)/2, cy2, 130, 28, GB.L3, GB.L2, 1);
+  txt('CLEAR ALL', BASE_W/2, cy2+14, GB.MM_FLAG, 6, 'center');
+  registerBtn('clear', (BASE_W-130)/2, cy2, 130, 28, async ()=>{
+    records = {};
+    try { localStorage.removeItem('dungeon-sweep-records'); } catch(e){}
+  });
+
+  const backY3 = cy2 + 52;
+  r((BASE_W-100)/2, backY3-10, 100, 26, GB.L2, GB.L3, 1);
+  txt('← BACK', BASE_W/2, backY3+3, GB.L0, 7, 'center');
+  registerBtn('back3', (BASE_W-100)/2, backY3-10, 100, 26, ()=>{ screen='title'; });
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// SCREEN: ACHIEVEMENTS
+// ─────────────────────────────────────────────────────────────────────
+function drawAchievements(){
+  menuButtons.length = 0;
+  r(0,0,BASE_W,BASE_H,GB.L3);
+  r(10,10,BASE_W-20,BASE_H-20,GB.SHELL,GB.L3,2);
+  r(SCR.x-4,SCR.y-4,SCR.w+8,SCR.h+8,GB.L3);
+  r(SCR.x,SCR.y,SCR.w,SCR.h,GB.L2);
+  r(SCR.x+6,SCR.y+6,SCR.w-12,SCR.h-12,GB.SCREEN_BG);
+
+  txt('ACHIEVEMENTS', BASE_W/2, SCR.y+30, GB.L3, 9, 'center');
+  const earned = ACHIEVEMENTS.filter(a=>achievements[a.id]).length;
+  txt(`${earned}/${ACHIEVEMENTS.length} UNLOCKED`, BASE_W/2, SCR.y+50, GB.L2, 6, 'center');
+  r(SCR.x+20, SCR.y+60, SCR.w-40, 2, GB.L2);
+
+  const rowH = 34, rowsY = SCR.y + 70;
+  ACHIEVEMENTS.forEach((a,i) => {
+    const ry = rowsY + i*rowH;
+    const has = achievements[a.id];
+    if(i%2===0) r(SCR.x+6, ry, SCR.w-12, rowH, GB.L1);
+    txt(a.icon, SCR.x+20, ry+rowH/2, has?GB.MM_VIS:GB.L2, 10, 'left');
+    txt(a.label, SCR.x+36, ry+12, has?GB.L3:GB.L2, 6, 'left');
+    txt(a.desc,  SCR.x+36, ry+24, has?GB.L2:GB.L3, 5, 'left');
+  });
+
+  const backY = SCR.y + SCR.h + 22;
+  r((BASE_W-100)/2, backY-10, 100, 26, GB.L2, GB.L3, 1);
+  txt('← BACK', BASE_W/2, backY+3, GB.L0, 7, 'center');
+  registerBtn('backA', (BASE_W-100)/2, backY-10, 100, 26, ()=>{ screen='title'; });
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// SCREEN: CHALLENGE (enter a seed code)
+// ─────────────────────────────────────────────────────────────────────
+let challengeInput = '';
+function drawChallenge(){
+  menuButtons.length = 0;
+  r(0,0,BASE_W,BASE_H,GB.L3);
+  r(10,10,BASE_W-20,BASE_H-20,GB.SHELL,GB.L3,2);
+  r(SCR.x-4,SCR.y-4,SCR.w+8,SCR.h+8,GB.L3);
+  r(SCR.x,SCR.y,SCR.w,SCR.h,GB.L2);
+  r(SCR.x+6,SCR.y+6,SCR.w-12,SCR.h-12,GB.SCREEN_BG);
+
+  txt('CHALLENGE', BASE_W/2, SCR.y+36, GB.L3, 11, 'center');
+  r(SCR.x+20, SCR.y+52, SCR.w-40, 2, GB.L2);
+  txt('ENTER SEED CODE', BASE_W/2, SCR.y+68, GB.L2, 7, 'center');
+  txt('FROM A FRIEND', BASE_W/2, SCR.y+82, GB.L2, 6, 'center');
+
+  // Input display
+  r(SCR.x+14, SCR.y+100, SCR.w-28, 32, GB.L3, GB.L2, 1);
+  const disp = challengeInput.padEnd(7,'_');
+  txt(disp, BASE_W/2, SCR.y+116, GB.L0, 11, 'center');
+
+  // Hex keypad (0-9, A-F, DEL, GO)
+  const keys = ['0','1','2','3','4','5','6','7','8','9','A','B','C','D','E','F','DEL','GO'];
+  const kw=46, kh=26, cols=6, startX=SCR.x+10, startY=SCR.y+145;
+  keys.forEach((k,i)=>{
+    const col=i%cols, row=Math.floor(i/cols);
+    const kx=startX+col*(kw+4), ky=startY+row*(kh+6);
+    const isGo = k==='GO';
+    r(kx,ky, isGo?kw*2+4:kw, kh, isGo?GB.L0:GB.L2, GB.L3, 1);
+    txt(k, kx+(isGo?kw+2:kw/2), ky+kh/2, GB.L3, 7, 'center');
+    if(isGo){
+      registerBtn('go', kx, ky, kw*2+4, kh, ()=>{
+        if(challengeInput.length===7){
+          challengeSeed = codeToSeed(challengeInput);
+          isDailyMode = false; gameMode='classic'; sizeKey='M';
+          challengeInput=''; startGame();
+        }
+      });
+    } else if(k==='DEL'){
+      registerBtn('del'+i, kx, ky, kw, kh, ()=>{ challengeInput=challengeInput.slice(0,-1); });
+    } else {
+      registerBtn('k'+k, kx, ky, kw, kh, ()=>{ if(challengeInput.length<7) challengeInput+=k; });
+    }
+  });
+
+  const backY = SCR.y + SCR.h + 22;
+  txt('← BACK', BASE_W/2, backY, GB.L2, 7, 'center');
+  registerBtn('backC', 0, backY-10, BASE_W, 24, ()=>{ screen='title'; challengeInput=''; });
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// SCREEN: GAME
+// ─────────────────────────────────────────────────────────────────────
+function drawGame(){
+  r(0,0,BASE_W,BASE_H,GB.L3);
+  r(10,10,BASE_W-20,BASE_H-20,GB.SHELL,GB.L3,2);
+
+  // Screen
+  r(SCR.x-4,SCR.y-4,SCR.w+8,SCR.h+8,GB.L3);
+  r(SCR.x,SCR.y,SCR.w,SCR.h,GB.L2);
+  r(SCR.x+6,SCR.y+6,SCR.w-12,SCR.h-12,GB.SCREEN_BG);
+
+  drawRoom();
+  drawMinimap();
+  drawHUD();
+  drawGameControls();
+  // Achievement toast
+  if(achTimer > 0 && newAchievement){
+    achTimer--;
+    if(achTimer===160) sndUnlock();
+    const alpha = achTimer > 150 ? 1 : achTimer/150;
+    X.globalAlpha = alpha;
+    r(ROOM.x+6, ROOM.y+6, ROOM.w-12, 36, GB.L3);
+    r(ROOM.x+6, ROOM.y+6, ROOM.w-12, 36, null, GB.MM_VIS, 1);
+    txt(newAchievement.icon+' UNLOCKED!', FCX, ROOM.y+18, GB.MM_VIS, 6);
+    txt(newAchievement.label, FCX, ROOM.y+30, GB.L1, 6);
+    X.globalAlpha = 1;
+  }
+}
+// ─────────────────────────────────────────────────────────────────────
+function drawRoom(){
+  const c = cell(px,py);
+  const num = mineExits(px,py);
+
+  // Outer wall blocks (4 sides)
+  r(ROOM.x, ROOM.y, ROOM.w, WT, GB.L2);                         // N wall
+  r(ROOM.x, ROOM.y+ROOM.h-WT, ROOM.w, WT, GB.L2);               // S wall
+  r(ROOM.x, ROOM.y, WT, ROOM.h, GB.L2);                         // W wall
+  r(ROOM.x+ROOM.w-WT, ROOM.y, WT, ROOM.h, GB.L2);               // E wall
+
+  // Floor
+  r(FL.x, FL.y, FL.w, FL.h, GB.L1);
+  // Floor dither / tile pattern
+  for(let fy=FL.y; fy<FL.y+FL.h; fy+=16){
+    for(let fx=FL.x; fx<FL.x+FL.w; fx+=16){
+      r(fx,fy,8,8,GB.L0);
+      r(fx+8,fy+8,8,8,GB.L0);
+    }
+  }
+  // Floor re-fill semi-transparent to blend checkers
+  X.globalAlpha=0.55;
+  r(FL.x,FL.y,FL.w,FL.h,GB.L1);
+  X.globalAlpha=1;
+
+  // Wall pixel decorations (corner blocks)
+  const cornerSz=8;
+  [[ROOM.x,ROOM.y],[ROOM.x+ROOM.w-cornerSz,ROOM.y],[ROOM.x,ROOM.y+ROOM.h-cornerSz],[ROOM.x+ROOM.w-cornerSz,ROOM.y+ROOM.h-cornerSz]].forEach(([cx2,cy2])=>{
+    r(cx2,cy2,cornerSz,cornerSz,GB.L3);
+  });
+
+  // Wall highlight lines
+  r(ROOM.x,ROOM.y,ROOM.w,1,GB.L0);
+  r(ROOM.x,ROOM.y,1,ROOM.h,GB.L0);
+
+  // Doors
+  ['n','s','e','w'].forEach(d => drawDoor(d, c));
+
+  // ── MINE COUNT – huge floor-stamp behind player ──────────────────────
+  if(phase==='play'||phase==='won'||phase==='nextfloor'){
+    // Show staircase stamp if standing in stair room (tower/endless only)
+    // Positioned top-right inside floor area, well clear of walls
+    if(cell(px,py)?.stair && staircaseX !== -1 && gameMode !== 'classic'){
+      txt('▲', FL.x + FL.w - 28, FL.y + 38, GB.L2, 56);
+    } else if(num===0){
+      for(let dy2=FL.y+10;dy2<FL.y+FL.h-6;dy2+=18)
+        for(let dx2=FL.x+10;dx2<FL.x+FL.w-6;dx2+=18)
+          r(dx2,dy2,3,3,GB.L2);
+    } else {
+      X.globalAlpha=0.22;
+      r(FL.x,FL.y,FL.w,FL.h, num>=3 ? GB.L3 : GB.L2);
+      X.globalAlpha=1;
+      X.globalAlpha=0.55;
+      txt(String(num), FCX, FCY+2, GB.L3, 88);
+      X.globalAlpha=1;
+      X.globalAlpha=0.18;
+      txt(String(num), FCX-2, FCY, GB.L0, 88);
+      X.globalAlpha=1;
+    }
+  }
+
+  // Player cube
+  if(phase!=='dead'){
+    const blink = (phase==='won'||phase==='nextfloor') && Math.floor(frame/8)%2===0;
+    if(!blink){
+      const pw=20,ph=20;
+      r(FCX-pw/2+2, FCY-ph/2+2, pw, ph, GB.L3);
+      r(FCX-pw/2, FCY-ph/2, pw, ph, GB.L0, GB.L3, 1);
+      r(FCX-pw/2+2, FCY-ph/2+2, pw-4, 4, GB.L1);
+      r(FCX-pw/2+2, FCY-ph/2+2, 4, ph-4, GB.L1);
+      r(FCX+pw/2-6, FCY-ph/2+4, 4, ph-6, GB.L2);
+    }
+  }
+
+  // Flag mode indicator
+  if(flagMode && phase==='play'){
+    flagModeAnim=(flagModeAnim+1)%20;
+    if(flagModeAnim<14){
+      r(ROOM.x+4, ROOM.y+4, 52, 16, GB.L3);
+      txt('FLAG', ROOM.x+30, ROOM.y+12, GB.L0, 7, 'center');
+    }
+  } else { flagModeAnim=0; }
+
+  // Staircase found — stamp in room handles indication, no extra blink needed
+
+  // DEAD overlay
+  if(phase==='dead'){
+    X.globalAlpha=0.45+0.2*Math.abs(Math.sin(frame*0.12));
+    r(FL.x,FL.y,FL.w,FL.h,GB.L3);
+    X.globalAlpha=1;
+    txt('KABOOM!', FCX, FCY-18, GB.L0, 10);
+    txt('☠', FCX, FCY+12, GB.L0, 16);
+  }
+
+  // CAUGHT overlay
+  if(phase==='caught'){
+    X.globalAlpha=0.5+0.2*Math.abs(Math.sin(frame*0.15));
+    r(FL.x,FL.y,FL.w,FL.h,GB.MM_SENTRY);
+    X.globalAlpha=1;
+    txt('CAUGHT!', FCX, FCY-18, GB.L3, 10);
+    txt('◈', FCX, FCY+12, GB.L3, 16);
+  }
+
+  // Sentry proximity warning
+  if(phase==='play' && gameMode==='sentry' && sentries.length){
+    const minDist = Math.min(...sentries.map(s=>Math.abs(s.x-px)+Math.abs(s.y-py)));
+    if(minDist <= 2){
+      const danger = minDist===1;
+      const blinkOn = !danger || Math.floor(frame/6)%2===0;
+      if(blinkOn){
+        r(ROOM.x+ROOM.w-68, ROOM.y+4, 64, 16, GB.L3);
+        txt(danger?'! CLOSE !':'NEARBY', ROOM.x+ROOM.w-36, ROOM.y+12,
+          GB.MM_SENTRY, danger?7:6, 'center');
+      }
+    }
+  }
+
+  // NEXT FLOOR overlay
+  if(phase==='nextfloor'){
+    X.globalAlpha=0.12+0.06*Math.abs(Math.sin(frame*0.1));
+    r(FL.x,FL.y,FL.w,FL.h,GB.L0);
+    X.globalAlpha=1;
+  }
+
+  // WIN overlay (classic or tower complete)
+  if(phase==='won'){
+    X.globalAlpha=0.12+0.06*Math.abs(Math.sin(frame*0.1));
+    r(FL.x,FL.y,FL.w,FL.h,GB.L0);
+    X.globalAlpha=1;
+  }
+
+  // ── Endgame / floor messages ──────────────────────────────────────
+  if(phase==='dead'||phase==='caught'){
+    const msg = phase==='caught' ? 'CAUGHT!' : 'GAME OVER';
+    const mc  = phase==='caught' ? GB.MM_SENTRY : GB.L0;
+    r(ROOM.x+10, ROOM.y+ROOM.h-30, ROOM.w-20, 22, GB.L3);
+    txt(msg, FCX, ROOM.y+ROOM.h-19, mc, 8);
+    txt('TAP TO MENU', FCX, ROOM.y+ROOM.h+8, GB.L2, 6);
+  }
+  if(phase==='won'){
+    const msg = gameMode==='tower' ? 'ESCAPED!' : isDailyMode ? 'DAILY DONE!' : 'CLEARED!';
+    r(ROOM.x+10, ROOM.y+ROOM.h-30, ROOM.w-20, 22, GB.L3);
+    txt(msg, FCX, ROOM.y+ROOM.h-19, GB.L0, 8);
+    if(newRecordFlag && Math.floor(frame/12)%2===0){
+      txt('★ NEW RECORD!', FCX, ROOM.y+ROOM.h+8, GB.MM_VIS, 6);
+    } else if(showSeedCode){
+      txt('CODE:'+seedToCode(currentSeed), FCX, ROOM.y+ROOM.h+8, GB.L2, 6);
+    } else {
+      txt('TAP TO MENU', FCX, ROOM.y+ROOM.h+8, GB.L2, 6);
+    }
+  }
+  if(phase==='nextfloor'){
+    const nf = floorNum + 1;
+    const msg = gameMode==='tower' ? `FLOOR ${nf}/${TOWER_FLOORS}` : `FLOOR ${nf}`;
+    r(ROOM.x+10, ROOM.y+ROOM.h-30, ROOM.w-20, 22, GB.L3);
+    txt('ASCENDING!', FCX, ROOM.y+ROOM.h-19, GB.L0, 8);
+    txt('TAP TO CONTINUE', FCX, ROOM.y+ROOM.h+8, GB.MM_CUR, 6);
+  }
+}
+
+function drawDoor(d, c){
+  const ex = hasExit(px, py, d);
+  let tx,ty,tw,th;
+  const cx2=ROOM.x+ROOM.w/2|0, cy2=ROOM.y+ROOM.h/2|0;
+  const dx1=cx2-DW/2|0, dx2=cx2+DW/2|0;
+  const dy1=cy2-DW/2|0, dy2=cy2+DW/2|0;
+
+  if(d==='n'){tx=dx1;ty=ROOM.y;tw=DW;th=WT;}
+  if(d==='s'){tx=dx1;ty=ROOM.y+ROOM.h-WT;tw=DW;th=WT;}
+  if(d==='w'){tx=ROOM.x;ty=dy1;tw=WT;th=DW;}
+  if(d==='e'){tx=ROOM.x+ROOM.w-WT;ty=dy1;tw=WT;th=DW;}
+
+  if(ex){
+    // Open door – tunnel
+    r(tx,ty,tw,th, GB.L3);
+    // Door frame (2px lines on sides)
+    X.strokeStyle=GB.L2; X.lineWidth=2;
+    if(d==='n'||d==='s'){
+      X.beginPath();X.moveTo(dx1,ROOM.y);X.lineTo(dx1,ROOM.y+WT);X.stroke();
+      X.beginPath();X.moveTo(dx2,ROOM.y);X.lineTo(dx2,ROOM.y+WT);X.stroke();
+      X.beginPath();X.moveTo(dx1,ROOM.y+ROOM.h-WT);X.lineTo(dx1,ROOM.y+ROOM.h);X.stroke();
+      X.beginPath();X.moveTo(dx2,ROOM.y+ROOM.h-WT);X.lineTo(dx2,ROOM.y+ROOM.h);X.stroke();
+    } else {
+      X.beginPath();X.moveTo(ROOM.x,dy1);X.lineTo(ROOM.x+WT,dy1);X.stroke();
+      X.beginPath();X.moveTo(ROOM.x,dy2);X.lineTo(ROOM.x+WT,dy2);X.stroke();
+      X.beginPath();X.moveTo(ROOM.x+ROOM.w-WT,dy1);X.lineTo(ROOM.x+ROOM.w,dy1);X.stroke();
+      X.beginPath();X.moveTo(ROOM.x+ROOM.w-WT,dy2);X.lineTo(ROOM.x+ROOM.w,dy2);X.stroke();
+    }
+
+    // Arrow hint (subtle) – hidden when flagged
+    const ax=d==='w'?tx+tw/2|0:(d==='e'?tx+tw/2|0:cx2);
+    const ay=d==='n'?ty+th/2|0:(d==='s'?ty+th/2|0:cy2);
+    const arrows={n:'▲',s:'▼',w:'◀',e:'▶'};
+    if(!c.flags[d]){
+      X.globalAlpha=0.3;
+      txt(arrows[d], ax, ay, GB.L1, 8);
+      X.globalAlpha=1;
+    }
+
+    // Flag on door – pixel-drawn flag (pole + banner)
+    if(c.flags[d]){
+      // Fill door with dark tint
+      r(tx,ty,tw,th, GB.L3);
+      // Bright border around door opening
+      r(tx,ty,tw,th, null, GB.L0, 2);
+      // Draw pixel flag: pole vertical, banner to the right
+      const fx=ax-4, fy=ay-10;
+      // Pole (2px wide, 14px tall)
+      r(fx, fy, 2, 14, GB.L0);
+      // Banner (8px wide, 6px tall) at top of pole
+      r(fx+2, fy, 8, 6, GB.L0);
+      // Inner banner highlight
+      r(fx+3, fy+1, 5, 2, GB.L2);
+      // Pole base foot
+      r(fx-2, fy+13, 6, 2, GB.L0);
+    }
+
+  } else {
+    // Dead end – darker wall fill
+    r(tx,ty,tw,th,GB.L3);
+    // Brick pattern
+    const brickH=8;
+    for(let yy=ty;yy<ty+th;yy+=brickH){
+      const offset=(Math.floor((yy-ty)/brickH)%2)*6;
+      for(let xx=tx+offset;xx<tx+tw;xx+=12){
+        r(xx,yy,10,brickH-1,null,GB.L2,1);
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// MINIMAP
+// ─────────────────────────────────────────────────────────────────────
+function roomHasFlag(x,y){
+  // A room should show red if a neighbouring room has flagged the door pointing HERE.
+  // e.g. if room (x-1,y) flagged its east door, then (x,y) is the suspected mine.
+  if(cell(x,   y+1)?.flags.n) return true; // room below flagged north → points to x,y
+  if(cell(x,   y-1)?.flags.s) return true; // room above flagged south → points to x,y
+  if(cell(x+1, y  )?.flags.w) return true; // room right flagged west  → points to x,y
+  if(cell(x-1, y  )?.flags.e) return true; // room left  flagged east  → points to x,y
+  return false;
+}
+
+function drawMinimap(){
+  const cs=MM.cs;
+  const mw=GS*cs, mh=GS*cs;
+  const mx=MM.x-mw-2, my=MM.y;
+  // Border
+  r(mx-3,my-3,mw+6,mh+6, GB.L3);
+  r(mx-2,my-2,mw+4,mh+4, null, GB.L2, 1);
+
+  for(let y2=0;y2<GS;y2++) for(let x2=0;x2<GS;x2++){
+    const cc=cell(x2,y2);
+    const isCurrent = x2===px && y2===py;
+    const isFlag    = roomHasFlag(x2,y2);
+    const isDead    = cc.visited && cc.mine;
+
+    let col;
+    if(isCurrent)       col = GB.MM_CUR;
+    else if(isDead)     col = GB.L3;
+    else if(isFlag)     col = GB.MM_FLAG;
+    else if(cc.stair && staircaseX !== -1) col = GB.MM_CUR;
+    else if(cc.visited) col = GB.MM_VIS;
+    else                col = GB.MM_UNVIS;
+
+    const isStair = cc.stair && staircaseX !== -1 && !isCurrent;
+    if(isStair && Math.floor(frame/12)%2===0) col = GB.MM_VIS;
+
+    // Sentry — subtle dark green, visible but not loud
+    const hasSentry = sentries.some(s=>s.x===x2&&s.y===y2);
+    if(hasSentry) col = GB.L2;
+
+    r(mx+x2*cs, my+y2*cs, cs-1, cs-1, col);
+    if(isCurrent) r(mx+x2*cs, my+y2*cs, cs-1, cs-1, null, GB.L3, 1);
+  }
+
+  // Legend
+  const lx=mx, ly=my+mh+4;
+  r(lx,      ly, cs-1, cs-1, GB.MM_CUR,  GB.L3, 1);
+  r(lx+cs,   ly, cs-1, cs-1, GB.MM_VIS);
+  r(lx+cs*2, ly, cs-1, cs-1, GB.MM_FLAG);
+  r(lx+cs*3, ly, cs-1, cs-1, GB.MM_UNVIS, GB.L2, 1);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// HUD
+// ─────────────────────────────────────────────────────────────────────
+function drawHUD(){
+  const hy=HUD_Y;
+  const hw=BASE_W-40;
+  r(20,hy,hw,80,GB.L2,GB.L3,2);
+  r(22,hy+2,hw-4,3,GB.L1);
+
+  const visitedSafe = grid ? grid.filter(c=>c.visited&&!c.mine).length : 0;
+  const pct = Math.round(visitedSafe/totalSafe*100);
+
+  // Left label changes by mode
+  let leftLabel = `ROOMS ${visitedSafe}/${totalSafe}`;
+  if(gameMode==='tower'){
+    leftLabel = `FLOOR ${floorNum}/${TOWER_FLOORS}`;
+    if(floorNum>=8) leftLabel += ' ◈'+(floorNum>=10?'◈':'');
+  }
+  if(gameMode==='endless'){
+    const best = records['endless'];
+    leftLabel = `FLOOR ${floorNum}` + (best ? `  BEST:${best.floors}` : '');
+  }
+
+  txt(leftLabel, 60, hy+22, GB.L0, 7, 'left');
+  // Move counter top-right
+  txt(`${moveCounter} MOVES`, BASE_W-40, hy+22, GB.MM_VIS, 7, 'right');
+
+  // Progress bar
+  const bx=24,by2=hy+34,bw=hw-8,bh=10;
+  r(bx,by2,bw,bh,GB.L3);
+  if(gameMode!=='classic'){
+    const threshX = bx+1+Math.round((bw-2)*STAIR_THRESHOLD);
+    r(threshX, by2, 2, bh, GB.L2);
+  }
+  r(bx+1,by2+1, Math.round((bw-2)*visitedSafe/totalSafe), bh-2, GB.L0);
+
+  // Status line
+  let msg='', mc=GB.L1;
+  if(phase==='dead')       { msg='YOU HIT A MINE'; mc=GB.L0; }
+  else if(phase==='caught'){ msg='THE SENTRY GOT YOU'; mc=GB.MM_SENTRY; }
+  else if(phase==='won')   { msg=gameMode==='tower'?'TOWER ESCAPED!':'DUNGEON CLEARED'; mc=GB.L0; }
+  else if(phase==='nextfloor'){ msg='STAIRCASE FOUND!'; mc=GB.MM_CUR; }
+  else if(flagMode)        { msg='FLAG MODE ON'; mc=GB.L0; }
+  else if(gameMode==='sentry' && sentries.length){
+    const d = Math.min(...sentries.map(s=>Math.abs(s.x-px)+Math.abs(s.y-py)));
+    msg = `SENTRY: ${d} ROOM${d!==1?'S':''} AWAY`; mc = d<=2?GB.MM_SENTRY:GB.L1;
+  }
+  else if(staircaseX!==-1 && gameMode!=='classic') { msg='▲ FIND THE STAIR!'; mc=GB.MM_CUR; }
+  else                     { msg=`MINES:${NM}  FLAGS:${countFlags()}`; mc=GB.L1; }
+  txt(msg, BASE_W/2, hy+57, mc, 7, 'center');
+  txt('TAP=FLAG  SWIPE=MOVE', BASE_W/2, hy+72, GB.L2, 5, 'center');
+}
+
+function countFlags(){
+  let n=0;
+  for(const c of grid) n+=Object.values(c.flags).filter(Boolean).length;
+  return n;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// GAME CONTROLS – D-pad, Flag, Restart
+// ─────────────────────────────────────────────────────────────────────
+// Button hit areas (canvas coords) – registered each frame
+const gameBtns = {};
+
+function drawGameControls(){
+  const cy = BASE_H - 95; // vertical centre of controls area
+
+  // ── D-PAD ──────────────────────────────────────────────────────────
+  const dcx = 88, dcy = cy;
+  const arm = 40, gap = 2;
+  // All 4 arms anchored symmetrically around (dcx, dcy)
+  const dpad = [
+    { id:'up',    x:dcx-arm/2,       y:dcy-arm/2-gap-arm, w:arm, h:arm, lbl:'▲' },
+    { id:'down',  x:dcx-arm/2,       y:dcy+arm/2+gap,     w:arm, h:arm, lbl:'▼' },
+    { id:'left',  x:dcx-arm/2-gap-arm, y:dcy-arm/2,       w:arm, h:arm, lbl:'◀' },
+    { id:'right', x:dcx+arm/2+gap,   y:dcy-arm/2,         w:arm, h:arm, lbl:'▶' },
+  ];
+  // centre nub – also registered as dead zone to swallow accidental taps
+  r(dcx-arm/2, dcy-arm/2, arm, arm, GB.L3);
+  gameBtns['dpad_centre'] = { x:dcx-arm/2, y:dcy-arm/2, w:arm, h:arm };
+
+  for(const b of dpad){
+    const pressed = gameBtns[b.id+'_pressed'];
+    r(b.x, b.y, b.w, b.h, pressed ? GB.BTN_PR : GB.BTN, GB.L3, 2);
+    if(!pressed){
+      r(b.x+2, b.y+2, b.w-4, 3, GB.BTN_HI); // top highlight
+    }
+    txt(b.lbl, b.x+b.w/2, b.y+b.h/2+1, GB.L0, 10);
+    // store hit area
+    gameBtns[b.id] = b;
+  }
+
+  // ── FLAG BUTTON ────────────────────────────────────────────────────
+  const fbx = 208, fby = cy - 30, fbw = 64, fbh = 64;
+  const flagPressed = flagMode;
+  r(fbx, fby, fbw, fbh, flagPressed ? GB.MM_FLAG : GB.BTN, GB.L3, 2);
+  if(!flagPressed) r(fbx+2, fby+2, fbw-4, 3, GB.BTN_HI);
+  // pixel flag icon
+  const fpx = fbx+22, fpy = fby+14;
+  r(fpx,   fpy,    3, 22, GB.L0);          // pole
+  r(fpx+3, fpy,   14,  9, flagPressed?GB.L0:GB.MM_FLAG); // banner
+  r(fpx+4, fpy+2,  9,  3, flagPressed?GB.MM_FLAG:GB.L2); // banner shade
+  r(fpx-3, fpy+21, 9,  3, GB.L0);          // base
+  txt('FLAG', fbx+fbw/2, fby+fbh-10, flagPressed?'#ffffff':GB.L1, 6);
+  gameBtns['flag'] = { x:fbx, y:fby, w:fbw, h:fbh };
+
+  // ── RESTART BUTTON ─────────────────────────────────────────────────
+  const rbx = 290, rby = cy - 30, rbw = 52, rbh = 28;
+  r(rbx, rby, rbw, rbh, GB.BTN, GB.L3, 2);
+  r(rbx+2, rby+2, rbw-4, 3, GB.BTN_HI);
+  txt('↺', rbx+rbw/2-2, rby+rbh/2+1, GB.L0, 11);
+  gameBtns['restart'] = { x:rbx, y:rby, w:rbw, h:rbh };
+
+  // QUIT button (smaller, below restart)
+  const qbx = 290, qby = rby+36, qbw = 52, qbh = 22;
+  r(qbx, qby, qbw, qbh, GB.BTN, GB.L3, 2);
+  r(qbx+2, qby+2, qbw-4, 3, GB.BTN_HI);
+  txt('MENU', qbx+qbw/2, qby+qbh/2+1, GB.L1, 5);
+  gameBtns['menu'] = { x:qbx, y:qby, w:qbw, h:qbh };
+
+  // Control hint
+  txt('SWIPE OR USE BUTTONS', BASE_W/2, BASE_H-8, GB.L3, 5);
+}
+
+function handleGameBtnTap(tx, ty){
+  for(const [id, b] of Object.entries(gameBtns)){
+    if(!b.x) continue;
+    if(tx>=b.x && tx<=b.x+b.w && ty>=b.y && ty<=b.y+b.h){
+      if(id==='up')    { flagMode ? doFlag(0,-1) : doMove(0,-1); flagMode=false; }
+      if(id==='down')  { flagMode ? doFlag(0, 1) : doMove(0, 1); flagMode=false; }
+      if(id==='left')  { flagMode ? doFlag(-1,0) : doMove(-1,0); flagMode=false; }
+      if(id==='right') { flagMode ? doFlag( 1,0) : doMove( 1,0); flagMode=false; }
+      if(id==='flag')  { flagMode = !flagMode; }
+      if(id==='restart'){ startGame(); }
+      if(id==='menu')  { screen='title'; flagMode=false; }
+      return true;
+    }
+  }
+  return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// MAIN LOOP
+// ─────────────────────────────────────────────────────────────────────
+function tick(){
+  frame++;
+  X.clearRect(0,0,BASE_W,BASE_H);
+
+  if(screen==='title')           drawTitle();
+  else if(screen==='size')       drawSizeSelect();
+  else if(screen==='sentryDiff') drawSentryDiff();
+  else if(screen==='records')    drawRecords();
+  else if(screen==='achievements') drawAchievements();
+  else if(screen==='challenge')  drawChallenge();
+  else if(screen==='game')       drawGame();
+
+  // Scanline pass
+  X.globalAlpha=0.03;
+  for(let y=0;y<BASE_H;y+=2) r(0,y,BASE_W,1,GB.L3);
+  X.globalAlpha=1;
+
+  requestAnimationFrame(tick);
+}
+
+loadRecords();
+loadAchievements();
+loadStreak();
+dailyDone = checkDailyDone();
+tick();
+
+if('serviceWorker' in navigator){
+  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js'));
+}
+</script>
+</body>
+</html>
