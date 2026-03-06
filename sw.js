@@ -1,4 +1,4 @@
-const CACHE = 'dungeon-sweep-v9';
+const CACHE = 'dungeon-sweep-v10';
 const ASSETS = [
   '/',
   '/index.html',

@@ -135,6 +135,57 @@ let sentryDiff = 'medium'; // easy | medium | hard
 let moveCounter = 0; // counts player moves, used for easy mode skip
 
 // ─────────────────────────────────────────────────────────────────────
+// SUPPORTER / IAP SYSTEM
+// ─────────────────────────────────────────────────────────────────────
+const IAP_PRODUCT_ID = 'support_developer';
+let isSupporter = false;
+let supportModalOpen = false;
+let supportModalReason = '';
+let sentryHardWins = 0;
+
+function loadSupportState(){
+  try {
+    const s = JSON.parse(localStorage.getItem('ds-support') || '{}');
+    isSupporter = !!s.supporter;
+    sentryHardWins = s.sentryHardWins || 0;
+  } catch(e){}
+}
+function saveSupportState(){
+  try { localStorage.setItem('ds-support', JSON.stringify({ supporter:isSupporter, sentryHardWins })); } catch(e){}
+}
+function onSupportPurchased(){
+  isSupporter = true; saveSupportState(); supportModalOpen = false;
+  if(typeof sndUnlock === 'function') sndUnlock();
+}
+function purchaseSupport(){
+  if(isSupporter){ supportModalOpen=false; return; }
+  // Capacitor native path — wired up in capacitor.config.ts
+  const iap = window.Capacitor?.Plugins?.['in-app-purchases'];
+  if(iap){
+    iap.purchase({ productId: IAP_PRODUCT_ID }).then(()=>onSupportPurchased()).catch(()=>{});
+    return;
+  }
+  // Web / dev stub
+  onSupportPurchased();
+}
+function restorePurchases(){
+  const iap = window.Capacitor?.Plugins?.['in-app-purchases'];
+  if(iap){ iap.restorePurchases().then(r=>{ if(r?.transactions?.some(t=>t.productId===IAP_PRODUCT_ID)) onSupportPurchased(); }).catch(()=>{}); }
+}
+function showSupportModal(reason){
+  if(isSupporter || supportModalOpen) return;
+  supportModalReason = reason; supportModalOpen = true;
+}
+function maybeTriggerSupport(trigger){
+  if(isSupporter || supportModalOpen) return;
+  if(trigger==='tower_win'){ showSupportModal('tower_win'); }
+  else if(trigger==='sentry_hard'){
+    sentryHardWins++; saveSupportState();
+    if(sentryHardWins===5||sentryHardWins===15) showSupportModal('sentry_hard');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // SEEDED RNG  (mulberry32)
 // ─────────────────────────────────────────────────────────────────────
 let rngState = 0;
@@ -624,6 +675,8 @@ function doMove(dx,dy) {
       saveRecord(recordKey(), moveCounter, 1).then(isNew => { newRecordFlag = isNew; });
       showSeedCode = true;
       checkAchievements();
+      if(gameMode==='sentry' && sentryDiff==='hard')
+        setTimeout(()=>maybeTriggerSupport('sentry_hard'), 2800);
     }
     if(phase==='play' && hasSentries) moveSentries();
     return;
@@ -644,6 +697,7 @@ function doMove(dx,dy) {
         saveRecord('tower', moveCounter, TOWER_FLOORS).then(isNew => { newRecordFlag = isNew; });
         showSeedCode = true;
         checkAchievements();
+        setTimeout(()=>maybeTriggerSupport('tower_win'), 2800);
       } else {
         phase = 'nextfloor';
         sndAscend();
@@ -907,6 +961,19 @@ function drawTitle(){
   const sndY = footerY + fbH + 10;
   txt(soundOn?'♪ SOUND ON':'♪ SOUND OFF', BASE_W/2, sndY+8, soundOn?GB.L2:GB.L3, 6, 'center');
   registerBtn('sound', 0, sndY, BASE_W, 20, ()=>{ soundOn=!soundOn; });
+
+  // ☕ Support button — small, bottom-left corner
+  const coffeeW=38, coffeeH=22;
+  const coffeeX=18, coffeeY=BASE_H-38;
+  r(coffeeX, coffeeY, coffeeW, coffeeH, GB.L3, GB.L2, 1);
+  txt('☕', coffeeX+coffeeW/2, coffeeY+coffeeH/2, GB.L2, 8, 'center');
+  registerBtn('coffee', coffeeX, coffeeY, coffeeW, coffeeH, ()=>{ showSupportModal('manual'); });
+
+  // ★ Supporter badge — top-right corner, permanent once unlocked
+  if(isSupporter){
+    r(BASE_W-52, 16, 38, 20, GB.L0, GB.MM_VIS, 1);
+    txt('★ SUP', BASE_W-33, 26, GB.MM_VIS, 6, 'center');
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1592,6 +1659,56 @@ function handleGameBtnTap(tx, ty){
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────
+// SUPPORT MODAL
+// ─────────────────────────────────────────────────────────────────────
+function drawSupportModal(){
+  // Dim backdrop
+  X.globalAlpha = 0.72;
+  r(0, 0, BASE_W, BASE_H, GB.L3);
+  X.globalAlpha = 1;
+
+  // Modal box
+  const mw=260, mh=200, mx=(BASE_W-mw)/2, my=(BASE_H-mh)/2;
+  r(mx, my, mw, mh, GB.SCREEN_BG, GB.L0, 3);
+  r(mx+2, my+2, mw-4, 4, GB.L0);
+
+  // Header line based on trigger reason
+  const headline = supportModalReason==='tower_win'  ? 'TOWER ESCAPED!' :
+                   supportModalReason==='sentry_hard' ? 'SENTRY HARD CLEARED!' :
+                   'SUPPORT THE GAME';
+  txt(headline, BASE_W/2, my+22, GB.MM_VIS, 7, 'center');
+
+  // Coffee icon
+  txt('☕', BASE_W/2, my+52, GB.L0, 22, 'center');
+
+  // Message lines
+  txt('THIS GAME IS ALWAYS FREE.', BASE_W/2, my+82, GB.L2, 6, 'center');
+  txt('IF YOU ENJOY IT,', BASE_W/2, my+96, GB.L2, 6, 'center');
+  txt('BUY ME A COFFEE?', BASE_W/2, my+110, GB.L2, 6, 'center');
+
+  // Buttons
+  const bW=100, bH=28, gap=12;
+  const totalBW = bW*2+gap, bStartX=(BASE_W-totalBW)/2;
+  const bY = my+mh-44;
+
+  // Later
+  r(bStartX, bY, bW, bH, GB.L3, GB.L2, 1);
+  txt('LATER', bStartX+bW/2, bY+bH/2, GB.L2, 7, 'center');
+
+  // Sure! (support)
+  r(bStartX+bW+gap, bY, bW, bH, GB.L0, GB.MM_VIS, 2);
+  r(bStartX+bW+gap+2, bY+2, bW-4, 3, GB.MM_VIS);
+  txt('SURE! ☕', bStartX+bW+gap+bW/2, bY+bH/2, GB.MM_VIS, 7, 'center');
+
+  // Register modal taps — using menuButtons so tap handler picks them up
+  // We push these fresh every frame since modal overlays any screen
+  // Use a direct canvas tap capture instead
+  menuButtons.push({ id:'sup_later', x:bStartX,        y:bY, w:bW,  h:bH, fn:()=>{ supportModalOpen=false; }});
+  menuButtons.push({ id:'sup_sure',  x:bStartX+bW+gap, y:bY, w:bW,  h:bH, fn:()=>{ purchaseSupport(); }});
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // MAIN LOOP
 // ─────────────────────────────────────────────────────────────────────
 function tick(){
@@ -1606,6 +1723,9 @@ function tick(){
   else if(screen==='challenge')  drawChallenge();
   else if(screen==='game')       drawGame();
 
+  // Support modal — drawn over any screen
+  if(supportModalOpen) drawSupportModal();
+
   // Scanline pass
   X.globalAlpha=0.03;
   for(let y=0;y<BASE_H;y+=2) r(0,y,BASE_W,1,GB.L3);
@@ -1617,6 +1737,8 @@ function tick(){
 loadRecords();
 loadAchievements();
 loadStreak();
+loadSupportState();
+restorePurchases();
 dailyDone = checkDailyDone();
 tick();
 
