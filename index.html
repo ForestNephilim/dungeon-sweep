@@ -160,11 +160,17 @@ function onSupportPurchased(){
 function purchaseSupport(){
   if(isSupporter){ supportModalOpen=false; return; }
   // Capacitor native path — wired up in capacitor.config.ts
-  const iap = window.Capacitor?.Plugins?.['in-app-purchases'];
-  if(iap){
-    iap.purchase({ productId: IAP_PRODUCT_ID }).then(()=>onSupportPurchased()).catch(()=>{});
-    return;
+function purchaseSupport(){
+  if(isSupporter){ supportModalOpen=false; return; }
+  const cap = window.Capacitor;
+  if(cap && cap.Plugins && cap.Plugins.Browser){
+    cap.Plugins.Browser.open({ url: 'https://ko-fi.com/forestnephilim' })
+      .catch(()=>{ window.open('https://ko-fi.com/forestnephilim','_blank','noopener'); });
+  } else {
+    window.open('https://ko-fi.com/forestnephilim','_blank','noopener');
   }
+  supportModalOpen = false;
+}
 // Web — open Ko-fi in browser
   window.open('https://ko-fi.com/forestnephilim', '_blank', 'noopener');
   supportModalOpen = false;
@@ -1705,8 +1711,8 @@ function drawSupportModal(){
   // Register modal taps — using menuButtons so tap handler picks them up
   // We push these fresh every frame since modal overlays any screen
   // Use a direct canvas tap capture instead
-  menuButtons.push({ id:'sup_later', x:bStartX,        y:bY, w:bW,  h:bH, fn:()=>{ supportModalOpen=false; }});
-  menuButtons.push({ id:'sup_sure',  x:bStartX+bW+gap, y:bY, w:bW,  h:bH, fn:()=>{ purchaseSupport(); }});
+menuButtons.push({ id:'sup_later', x:bStartX,        y:bY, w:bW,  h:bH, action:()=>{ supportModalOpen=false; }});
+  menuButtons.push({ id:'sup_sure',  x:bStartX+bW+gap, y:bY, w:bW,  h:bH, action:()=>{ purchaseSupport(); }});
 }
 
 // ─────────────────────────────────────────────────────────────────────

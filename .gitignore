@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Capacitor Android build (generated, not needed in repo)
+android/
+ios/
+
+# Capacitor config generated files
+capacitor-cordova-android-plugins/
+
+# Build outputs
+dist/
+build/
+www/
+
+# npm
+package-lock.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+npm-debug.log*
