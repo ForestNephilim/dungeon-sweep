@@ -159,9 +159,6 @@ function onSupportPurchased(){
 }
 function purchaseSupport(){
   if(isSupporter){ supportModalOpen=false; return; }
-  // Capacitor native path — wired up in capacitor.config.ts
-function purchaseSupport(){
-  if(isSupporter){ supportModalOpen=false; return; }
   const cap = window.Capacitor;
   if(cap && cap.Plugins && cap.Plugins.Browser){
     cap.Plugins.Browser.open({ url: 'https://ko-fi.com/forestnephilim' })
@@ -169,10 +166,6 @@ function purchaseSupport(){
   } else {
     window.open('https://ko-fi.com/forestnephilim','_blank','noopener');
   }
-  supportModalOpen = false;
-}
-// Web — open Ko-fi in browser
-  window.open('https://ko-fi.com/forestnephilim', '_blank', 'noopener');
   supportModalOpen = false;
 }
 function restorePurchases(){
