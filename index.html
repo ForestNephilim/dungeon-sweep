@@ -165,8 +165,9 @@ function purchaseSupport(){
     iap.purchase({ productId: IAP_PRODUCT_ID }).then(()=>onSupportPurchased()).catch(()=>{});
     return;
   }
-  // Web / dev stub
-  onSupportPurchased();
+// Web — open Ko-fi in browser
+  window.open('https://ko-fi.com/forestnephilim', '_blank', 'noopener');
+  supportModalOpen = false;
 }
 function restorePurchases(){
   const iap = window.Capacitor?.Plugins?.['in-app-purchases'];
